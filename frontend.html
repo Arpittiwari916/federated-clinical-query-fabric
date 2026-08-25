@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Federated Clinical Query Fabric</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="app"></div>
+>
+<script>
+  
+// ============================================================================
+// State
+// ============================================================================
+const state = {
+  token: null,
+  user: null,
+  backendMode: null,
+  view: "dashboard",
+  institutions: [],
+  terminology: null,
+  lastQuery: null,          // last executed query record
+  lastProvenanceQueryId: null,
+  provenance: null,
+  auditEntries: [],
+  benchmarkResult: null,
+  benchmarkHistory: [],
+  loading: {},
+  toast: null,
+  qb: {
+    queryType: "patient_count",
+    logic: "AND",
+    diagnosis: [],           // [{code}]
+    medication: [],          // [{code}]
+    lab: [],                 // [{code, operator, value}]
+    dateStart: "",
+    dateEnd: "",
+  },
+};
+
+const NAV = [
+  { id: "dashboard", label: "Dashboard", icon: "◧", perm: null },
+  { id: "query-builder", label: "Query Builder", icon: "▤", perm: "submit_query" },
+  { id: "execution", label: "Execution", icon: "▸", perm: null },
+  { id: "institutions", label: "Institutions", icon: "◈", perm: "view_institutions" },
+  { id: "provenance", label: "Provenance", icon: "⌘", perm: "view_provenance" },
+  { id: "audit", label: "Audit Log", icon: "☰", perm: "view_audit" },
+  { id: "benchmark", label: "Benchmark", icon: "≋", perm: null },
+];
+
+const ROLE_PERMS = {
+  RESEARCHER: ["submit_query", "view_own_queries", "view_provenance", "view_institutions"],
+  INSTITUTION_OPERATOR: ["view_institutions", "manage_institutions", "view_own_queries"],
+  AUDITOR: ["view_audit", "view_provenance", "validate_result", "view_institutions"],
+  ADMIN: ["submit_query", "view_own_queries", "view_provenance", "view_institutions", "manage_institutions", "view_audit", "validate_result", "manage_users"],
+};
+
+function can(perm) {
+  if (!perm) return true;
+  if (!state.user) return false;
+  return (ROLE_PERMS[state.user.role] || []).includes(perm);
+}
+
+// ============================================================================
+// API helper
+// ============================================================================
+async function api(path, { method = "GET", body } = {}) {
+  const headers = { "Content-Type": "application/json" };
+  if (state.token) headers["Authorization"] = "Bearer " + state.token;
+  const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  let data;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (!res.ok) {
+    const msg = (data && data.message) || `Request failed (${res.status})`;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+function showToast(message, type = "ok") {
+  state.toast = { message, type };
+  render();
+  setTimeout(() => { state.toast = null; render(); }, 3200);
+}
+
+// ============================================================================
+// Auth
+// ============================================================================
+async function login(username, password) {
+  state.loading.login = true; render();
+  try {
+    const data = await api("/api/auth/login", { method: "POST", body: { username, password } });
+    state.token = data.token;
+    state.user = { uid: data.uid, role: data.role, name: data.name };
+    state.backendMode = data.backend_mode;
+    state.loading.login = false;
+    await bootstrap();
+  } catch (e) {
+    state.loading.login = false;
+    state.loginError = e.message;
+    render();
+  }
+}
+
+function logout() {
+  Object.assign(state, { token: null, user: null, view: "dashboard", lastQuery: null, provenance: null });
+  render();
+}
+
+async function bootstrap() {
+  try {
+    const [instRes, termRes] = await Promise.all([
+      api("/api/institutions"),
+      can("submit_query") || can("manage_users") ? api("/api/terminology") : Promise.resolve(null),
+    ]);
+    state.institutions = instRes.institutions;
+    state.terminology = termRes;
+  } catch (e) { /* non-fatal */ }
+  state.view = "dashboard";
+  render();
+}
+
+// ============================================================================
+// Actions
+// ============================================================================
+async function refreshInstitutions() {
+  const data = await api("/api/institutions");
+  state.institutions = data.institutions;
+  render();
+}
+
+function buildCanonicalQuery() {
+  const conditions = [];
+  state.qb.diagnosis.forEach(d => d.code && conditions.push({ type: "diagnosis", code: d.code }));
+  state.qb.medication.forEach(m => m.code && conditions.push({ type: "medication", code: m.code }));
+  state.qb.lab.forEach(l => l.code && conditions.push({ type: "lab", code: l.code, operator: l.operator, value: parseFloat(l.value) }));
+  const q = { query_type: state.qb.queryType, conditions, logic: state.qb.logic };
+  if (state.qb.dateStart && state.qb.dateEnd) {
+    q.date_range = { start: state.qb.dateStart, end: state.qb.dateEnd };
+  }
+  return q;
+}
+
+async function executeQuery() {
+  const query = buildCanonicalQuery();
+  if (query.conditions.length === 0) { showToast("Add at least one condition before executing.", "error"); return; }
+  state.loading.execute = true; render();
+  try {
+    const record = await api("/api/query", { method: "POST", body: query });
+    state.lastQuery = record;
+    state.lastProvenanceQueryId = record.query_id;
+    state.loading.execute = false;
+    state.view = "execution";
+    render();
+    showToast(`Query ${record.query_id} executed — ${record.completeness}`, record.completeness === "COMPLETE" ? "ok" : "error");
+  } catch (e) {
+    state.loading.execute = false;
+    render();
+    showToast(e.message, "error");
+  }
+}
+
+async function loadProvenance(queryId) {
+  state.loading.provenance = true; render();
+  try {
+    const prov = await api(`/api/query/${queryId}/provenance`);
+    state.provenance = prov;
+    state.lastProvenanceQueryId = queryId;
+  } catch (e) { showToast(e.message, "error"); }
+  state.loading.provenance = false;
+  state.view = "provenance";
+  render();
+}
+
+async function validateCurrentQuery() {
+  if (!state.lastQuery) return;
+  state.loading.validate = true; render();
+  try {
+    const result = await api(`/api/query/${state.lastQuery.query_id}/validate`, { method: "POST" });
+    state.lastQuery.validation_status = result.valid ? "VALID" : "INVALID";
+    state.lastValidation = result;
+    showToast(result.valid ? "Result validated: VALID" : `Validation failed: ${result.reason}`, result.valid ? "ok" : "error");
+  } catch (e) { showToast(e.message, "error"); }
+  state.loading.validate = false;
+  render();
+}
+
+async function simulateFailure(instId) {
+  try {
+    await api(`/api/institutions/${instId}/simulate-failure`, { method: "POST" });
+    await refreshInstitutions();
+    showToast(`${instId} marked OFFLINE (simulated)`, "error");
+  } catch (e) { showToast(e.message, "error"); }
+}
+
+async function restoreInstitution(instId) {
+  try {
+    await api(`/api/institutions/${instId}/restore`, { method: "POST" });
+    await refreshInstitutions();
+    showToast(`${instId} restored ONLINE`, "ok");
+  } catch (e) { showToast(e.message, "error"); }
+}
+
+async function loadAudit() {
+  state.loading.audit = true; render();
+  try {
+    const data = await api("/api/audit");
+    state.auditEntries = data.entries;
+  } catch (e) { showToast(e.message, "error"); }
+  state.loading.audit = false;
+  render();
+}
+
+async function runBenchmark() {
+  state.loading.benchmark = true; render();
+  try {
+    const result = await api("/api/benchmark", { method: "POST" });
+    state.benchmarkResult = result;
+    showToast("Benchmark complete", "ok");
+  } catch (e) { showToast(e.message, "error"); }
+  state.loading.benchmark = false;
+  render();
+}
+
+function setView(view) {
+  state.view = view;
+  render();
+  if (view === "audit" && can("view_audit")) loadAudit();
+  if (view === "institutions" && can("view_institutions")) refreshInstitutions();
+}
+
+// ============================================================================
+// Render: shell
+// ============================================================================
+function render() {
+  const app = document.getElementById("app");
+  app.innerHTML = state.user ? renderShell() : renderLogin();
+  attachHandlers();
+}
+
+function esc(s) { return (s ?? "").toString().replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+function renderLogin() {
+  return `
+  <div class="login-screen">
+    <div class="login-card">
+      <div class="login-brand"><span class="node-dot"></span><span class="login-title">Clinical Query Fabric</span></div>
+      <p class="login-sub">Federated analytics across independent healthcare institutions. No patient records leave any institution.</p>
+      ${state.loginError ? `<div class="login-error">${esc(state.loginError)}</div>` : ""}
+      <form id="login-form">
+        <div class="field"><label>Username</label><input name="username" autocomplete="username" placeholder="researcher1" required /></div>
+        <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password" placeholder="••••••••" required /></div>
+        <button class="btn btn-primary btn-full" type="submit" ${state.loading.login ? "disabled" : ""}>
+          ${state.loading.login ? `<span class="spinner"></span> Signing in…` : "Sign in"}
+        </button>
+      </form>
+      <div class="demo-creds">
+        <b>Demo credentials</b><br/>
+        researcher1 / researcher123 — Researcher<br/>
+        operator1 / operator123 — Institution Operator<br/>
+        auditor1 / auditor123 — Auditor<br/>
+        admin1 / admin123 — Admin
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderShell() {
+  const view = state.view;
+  return `
+  <div class="app-shell">
+    <div class="sidebar">
+      <div class="brand"><span class="node-dot"></span><div class="brand-text">Clinical Query Fabric<small>Federated Analytics</small></div></div>
+      <div class="nav">
+        ${NAV.filter(n => can(n.perm)).map(n => `
+          <div class="nav-item ${view === n.id ? "active" : ""}" data-nav="${n.id}">
+            <span class="icon">${n.icon}</span>${n.label}
+          </div>`).join("")}
+      </div>
+      <div class="sidebar-footer">
+        <div class="user-chip">
+          <div class="user-avatar">${esc((state.user.name || "?").split(" ").map(x => x[0]).join("").slice(0,2))}</div>
+          <div class="user-meta"><div class="user-name">${esc(state.user.name)}</div><div class="user-role">${esc(state.user.role)}</div></div>
+        </div>
+        <div class="logout-link" id="logout-btn">Sign out</div>
+      </div>
+    </div>
+    <div class="main">
+      ${renderView(view)}
+    </div>
+  </div>
+  ${state.toast ? `<div class="toast ${state.toast.type}">${esc(state.toast.message)}</div>` : ""}
+  `;
+}
+
+function renderView(view) {
+  switch (view) {
+    case "dashboard": return renderDashboard();
+    case "query-builder": return can("submit_query") ? renderQueryBuilder() : renderForbidden();
+    case "execution": return renderExecution();
+    case "institutions": return renderInstitutions();
+    case "provenance": return can("view_provenance") ? renderProvenance() : renderForbidden();
+    case "audit": return can("view_audit") ? renderAudit() : renderForbidden();
+    case "benchmark": return renderBenchmark();
+    default: return renderDashboard();
+  }
+}
+
+function renderForbidden() {
+  return `<div class="topbar"><div><div class="page-title">Access restricted</div><div class="page-sub">Your role does not include this permission.</div></div></div>`;
+}
+
+// ============================================================================
+// Dashboard
+// ============================================================================
+function renderDashboard() {
+  const online = state.institutions.filter(i => i.online).length;
+  return `
+  <div class="topbar">
+    <div><div class="page-title">Dashboard</div><div class="page-sub">Federation overview — ${esc(state.backendMode || "")} persistence mode</div></div>
+    <div class="synthetic-banner">SYNTHETIC DATA — PROTOTYPE ONLY — NOT FOR CLINICAL USE</div>
+  </div>
+  <div class="grid grid-4">
+    <div class="card stat-card"><div class="stat-label">Institutions</div><div class="stat-value">${state.institutions.length}</div></div>
+    <div class="card stat-card"><div class="stat-label">Online</div><div class="stat-value teal">${online}</div></div>
+    <div class="card stat-card"><div class="stat-label">Last Query Result</div><div class="stat-value ${state.lastQuery ? "teal" : ""}">${state.lastQuery ? state.lastQuery.final_result : "—"}</div></div>
+    <div class="card stat-card"><div class="stat-label">Last Query Status</div><div class="stat-value ${state.lastQuery && state.lastQuery.completeness === "INCOMPLETE" ? "amber" : ""}">${state.lastQuery ? state.lastQuery.completeness : "—"}</div></div>
+  </div>
+
+  <div class="section-gap card">
+    <div class="card-title">Federation topology <span class="hint">researcher → institutions → aggregate</span></div>
+    <div class="topology-wrap">${renderTopologySvg()}</div>
+  </div>
+
+  <div class="section-gap grid grid-2">
+    <div class="card">
+      <div class="card-title">Participating institutions</div>
+      ${state.institutions.map(i => `
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--border-soft)">
+          <div><div style="font-weight:600;font-size:13px">${esc(i.name)}</div><div class="muted" style="font-size:11.5px">${esc(i.type)}</div></div>
+          ${statusBadge(i.online ? "online" : "offline")}
+        </div>`).join("")}
+    </div>
+    <div class="card">
+      <div class="card-title">Get started</div>
+      <p class="muted" style="line-height:1.7;font-size:12.5px">
+        Build a canonical clinical query — no SQL, no raw record access. The federation
+        translates it into each institution's local schema, computes locally, and
+        returns only aggregate counts.
+      </p>
+      ${can("submit_query") ? `<button class="btn btn-primary" data-nav="query-builder">Open Query Builder</button>` : ""}
+    </div>
+  </div>`;
+}
+
+function renderTopologySvg() {
+  const insts = state.institutions.length ? state.institutions : [{id:"a",name:"Hospital Alpha",online:true},{id:"b",name:"Hospital Beta",online:true},{id:"c",name:"Lab Gamma",online:true},{id:"d",name:"Hospital Delta",online:true}];
+  const cx = 340, cy = 150, r = 120;
+  const positions = insts.map((inst, i) => {
+    const angle = (-90 + (360 / insts.length) * i) * Math.PI / 180;
+    return { inst, x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) };
+  });
+  const links = positions.map(p => {
+    const color = p.inst.online === false ? "var(--red)" : "var(--teal)";
+    const cls = p.inst.online === false ? "" : "link-anim";
+    return `<line x1="${cx}" y1="${cy}" x2="${p.x}" y2="${p.y}" stroke="${color}" stroke-width="1.5" class="${cls}" opacity="0.75" />`;
+  }).join("");
+  const nodes = positions.map(p => {
+    const color = p.inst.online === false ? "var(--red)" : "var(--teal)";
+    return `
+      <circle cx="${p.x}" cy="${p.y}" r="20" fill="var(--panel-raised)" stroke="${color}" stroke-width="1.5" />
+      <text x="${p.x}" y="${p.y - 28}" text-anchor="middle" fill="var(--text-muted)" font-family="var(--font-mono)" font-size="10">${esc(p.inst.name)}</text>
+      <circle cx="${p.x}" cy="${p.y}" r="4" fill="${color}" />
+    `;
+  }).join("");
+  return `
+  <svg class="topology-svg" viewBox="0 0 680 300" width="100%" style="max-width:640px">
+    ${links}
+    <circle class="hub-pulse" cx="${cx}" cy="${cy}" r="30" fill="var(--violet-dim)" stroke="var(--violet)" stroke-width="1.5" />
+    <text x="${cx}" y="${cy + 4}" text-anchor="middle" fill="var(--violet)" font-family="var(--font-mono)" font-size="10" font-weight="700">FABRIC</text>
+    ${nodes}
+  </svg>`;
+}
+
+function statusBadge(kind) {
+  const map = {
+    online: ["badge-online", "ONLINE"], offline: ["badge-offline", "OFFLINE"],
+    SUCCESS: ["badge-success", "SUCCESS"], SUPPRESSED: ["badge-suppressed", "SUPPRESSED"],
+    TIMEOUT: ["badge-timeout", "TIMEOUT"], DENIED: ["badge-denied", "DENIED"],
+    FAILED: ["badge-failed", "FAILED"], UNAVAILABLE: ["badge-unavailable", "UNAVAILABLE"],
+    COMPLETE: ["badge-complete", "COMPLETE"], INCOMPLETE: ["badge-incomplete", "INCOMPLETE"],
+    VALID: ["badge-valid", "VALID"], INVALID: ["badge-invalid", "INVALID"],
+    NOT_VALIDATED: ["badge-neutral", "NOT VALIDATED"],
+  };
+  const [cls, label] = map[kind] || ["badge-neutral", kind];
+  return `<span class="badge ${cls}"><span class="badge-dot"></span>${label}</span>`;
+}
+
+// ============================================================================
+// Query Builder
+// ============================================================================
+function renderQueryBuilder() {
+  const t = state.terminology || { diagnosis: [], medication: [], lab: [] };
+  const opt = (arr, sel) => arr.map(o => `<option value="${esc(o.code)}" ${o.code === sel ? "selected" : ""}>${esc(o.label)}</option>`).join("");
+
+  const diagRows = state.qb.diagnosis.map((d, i) => `
+    <div class="qb-row">
+      <div><label style="font-size:10.5px;color:var(--text-faint)">Diagnosis</label>
+        <select data-qb="diagnosis" data-idx="${i}" data-field="code">
+          <option value="">Select…</option>${opt(t.diagnosis, d.code)}
+        </select>
+      </div>
+      <div></div>
+      <div></div>
+      <div class="qb-remove" data-remove="diagnosis" data-idx="${i}">✕</div>
+    </div>`).join("");
+
+  const medRows = state.qb.medication.map((m, i) => `
+    <div class="qb-row">
+      <div><label style="font-size:10.5px;color:var(--text-faint)">Medication</label>
+        <select data-qb="medication" data-idx="${i}" data-field="code">
+          <option value="">Select…</option>${opt(t.medication, m.code)}
+        </select>
+      </div>
+      <div></div><div></div>
+      <div class="qb-remove" data-remove="medication" data-idx="${i}">✕</div>
+    </div>`).join("");
+
+  const labRows = state.qb.lab.map((l, i) => `
+    <div class="qb-row lab">
+      <div><label style="font-size:10.5px;color:var(--text-faint)">Lab test</label>
+        <select data-qb="lab" data-idx="${i}" data-field="code"><option value="">Select…</option>${opt(t.lab, l.code)}</select>
+      </div>
+      <div><label style="font-size:10.5px;color:var(--text-faint)">Operator</label>
+        <select data-qb="lab" data-idx="${i}" data-field="operator">
+          ${[">",">=","<","<=","==","!="].map(o => `<option ${o===l.operator?"selected":""}>${o}</option>`).join("")}
+        </select>
+      </div>
+      <div><label style="font-size:10.5px;color:var(--text-faint)">Value</label>
+        <input type="number" step="0.1" value="${esc(l.value)}" data-qb="lab" data-idx="${i}" data-field="value" />
+      </div>
+      <div></div>
+      <div class="qb-remove" data-remove="lab" data-idx="${i}">✕</div>
+    </div>`).join("");
+
+  const query = buildCanonicalQuery();
+
+  return `
+  <div class="topbar"><div><div class="page-title">Query Builder</div><div class="page-sub">Canonical clinical query — no SQL, aggregate-only results</div></div></div>
+
+  <div class="card">
+    <div class="card-title">Conditions</div>
+
+    <div class="pill-row" style="margin-bottom:14px">
+      <span class="tag">Diagnosis</span><span class="tag">Medication</span><span class="tag">Laboratory value</span><span class="tag">Date range</span>
+    </div>
+
+    <div style="margin-bottom:8px;font-size:12px;font-weight:600;color:var(--text-muted)">Diagnosis</div>
+    ${diagRows || '<div class="muted" style="font-size:12px;margin-bottom:8px">No diagnosis conditions added.</div>'}
+    <button class="btn btn-sm" id="add-diagnosis" style="margin-bottom:16px">+ Add diagnosis</button>
+
+    <div style="margin-bottom:8px;font-size:12px;font-weight:600;color:var(--text-muted)">Medication</div>
+    ${medRows || '<div class="muted" style="font-size:12px;margin-bottom:8px">No medication conditions added.</div>'}
+    <button class="btn btn-sm" id="add-medication" style="margin-bottom:16px">+ Add medication</button>
+
+    <div style="margin-bottom:8px;font-size:12px;font-weight:600;color:var(--text-muted)">Laboratory value</div>
+    ${labRows || '<div class="muted" style="font-size:12px;margin-bottom:8px">No lab conditions added.</div>'}
+    <button class="btn btn-sm" id="add-lab" style="margin-bottom:16px">+ Add lab condition</button>
+
+    <div style="margin-bottom:8px;font-size:12px;font-weight:600;color:var(--text-muted)">Date range (optional)</div>
+    <div class="qb-row" style="grid-template-columns:1fr 1fr auto auto">
+      <div><input type="date" id="date-start" value="${esc(state.qb.dateStart)}" /></div>
+      <div><input type="date" id="date-end" value="${esc(state.qb.dateEnd)}" /></div>
+      <div></div><div></div>
+    </div>
+
+    <div class="section-gap"></div>
+    <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:8px">Combine conditions with</div>
+    <div class="logic-toggle">
+      <div class="logic-btn ${state.qb.logic === "AND" ? "active" : ""}" data-logic="AND">AND</div>
+      <div class="logic-btn ${state.qb.logic === "OR" ? "active" : ""}" data-logic="OR">OR</div>
+    </div>
+
+    <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:8px">Canonical query (sent to the federation — never raw SQL)</div>
+    <div class="query-json-preview">${esc(JSON.stringify(query, null, 2))}</div>
+
+    <div class="section-gap">
+      <button class="btn btn-primary" id="execute-query-btn" ${state.loading.execute ? "disabled" : ""}>
+        ${state.loading.execute ? `<span class="spinner"></span> Executing federated query…` : "Execute federated query"}
+      </button>
+    </div>
+  </div>`;
+}
+
+// ============================================================================
+// Execution
+// ============================================================================
+function renderExecution() {
+  const r = state.lastQuery;
+  if (!r) {
+    return `<div class="topbar"><div><div class="page-title">Execution</div><div class="page-sub">No query has been executed yet.</div></div></div>
+    <div class="card"><div class="empty-state">Run a query from the Query Builder to see per-institution execution here.</div></div>`;
+  }
+  const rows = r.institution_results.map(res => `
+    <div class="exec-node-row">
+      <div>
+        <div class="exec-node-name">${esc(instName(res.institution))}</div>
+        <div class="exec-node-meta">${res.execution_time_ms} ms${res.reason ? " · " + esc(res.reason) : ""}</div>
+      </div>
+      <div class="exec-node-right">
+        ${res.status === "SUCCESS" ? `<div class="exec-count">${res.patient_count}</div>` : `<div class="exec-count muted">—</div>`}
+        ${statusBadge(res.status)}
+      </div>
+    </div>`).join("");
+
+  return `
+  <div class="topbar">
+    <div><div class="page-title">Execution — <span class="query-id-link" style="font-size:16px">${esc(r.query_id)}</span></div>
+    <div class="page-sub">${r.participating_institutions.length} institutions queried · ${esc(r.timestamp)}</div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Per-institution results <span class="hint">local computation only</span></div>
+    ${rows}
+    <div class="total-banner ${r.completeness === "INCOMPLETE" ? "incomplete" : ""}">
+      <div><div class="total-banner-value">${r.final_result}</div><div class="total-banner-label">Aggregate patient count</div></div>
+      <div style="text-align:right">
+        ${statusBadge(r.completeness)}
+        <div class="muted" style="font-size:11.5px;margin-top:6px">${r.completeness === "INCOMPLETE" ? `Partial total — ${r.successful_institutions.length + (r.institution_results.filter(x=>x.status==='SUPPRESSED').length)} of ${r.participating_institutions.length} institutions responded` : "All institutions responded"}</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-gap" style="display:flex;gap:10px;flex-wrap:wrap">
+    <button class="btn" data-nav-load-prov="${r.query_id}">View provenance</button>
+    ${can("validate_result") ? `<button class="btn" id="validate-btn" ${state.loading.validate ? "disabled" : ""}>${state.loading.validate ? "Validating…" : "Validate result"}</button>` : ""}
+    ${r.validation_status && r.validation_status !== "NOT_VALIDATED" ? statusBadge(r.validation_status) : ""}
+    ${can("submit_query") ? `<button class="btn btn-primary" data-nav="query-builder">Run another query</button>` : ""}
+  </div>
+  ${state.lastValidation && state.lastValidation.query_id === r.query_id ? `
+    <div class="card section-gap">
+      <div class="card-title">Validation result</div>
+      <dl class="kv-grid">
+        <dt>Valid</dt><dd>${state.lastValidation.valid ? "true" : "false"}</dd>
+        <dt>Reason</dt><dd>${esc(state.lastValidation.reason || "")}</dd>
+        ${"expected_total" in state.lastValidation ? `<dt>Expected total</dt><dd>${state.lastValidation.expected_total}</dd>` : ""}
+        ${"recorded_total" in state.lastValidation ? `<dt>Recorded total</dt><dd>${state.lastValidation.recorded_total}</dd>` : ""}
+      </dl>
+    </div>` : ""}
+  `;
+}
+
+function instName(id) {
+  const found = state.institutions.find(i => i.id === id);
+  return found ? found.name : id;
+}
+
+// ============================================================================
+// Institutions monitor
+// ============================================================================
+function renderInstitutions() {
+  return `
+  <div class="topbar"><div><div class="page-title">Institution Monitor</div><div class="page-sub">Independent institutions — each holds its own local data, schema, and policy</div></div></div>
+  <div class="grid grid-2">
+    ${state.institutions.map(i => `
+      <div class="card">
+        <div class="card-title">${esc(i.name)} ${statusBadge(i.online ? "online" : "offline")}</div>
+        <div class="muted" style="font-size:12px;margin-bottom:10px">${esc(i.type)} · ~${i.record_count.toLocaleString()} synthetic records</div>
+        <dl class="kv-grid" style="margin-bottom:14px">
+          <dt>Local schema</dt><dd>${i.local_schema.map(esc).join(", ")}</dd>
+          <dt>Min group size</dt><dd>${i.policy.minimum_group_size}</dd>
+          <dt>Allowed ops</dt><dd>${i.policy.allowed_operations.map(esc).join(", ")}</dd>
+        </dl>
+        ${can("manage_institutions") ? `
+          <div style="display:flex;gap:8px">
+            ${i.online ? `<button class="btn btn-danger btn-sm" data-sim-failure="${i.id}">Simulate failure</button>`
+                       : `<button class="btn btn-sm" data-restore="${i.id}">Restore institution</button>`}
+          </div>` : ""}
+      </div>`).join("")}
+  </div>`;
+}
+
+// ============================================================================
+// Provenance
+// ============================================================================
+function renderProvenance() {
+  const p = state.provenance;
+  if (!p) {
+    return `<div class="topbar"><div><div class="page-title">Provenance</div><div class="page-sub">How exactly was a result produced?</div></div></div>
+    <div class="card"><div class="empty-state">${state.lastQuery ? `<button class="btn" data-nav-load-prov="${state.lastQuery.query_id}">Load provenance for ${esc(state.lastQuery.query_id)}</button>` : "Run a query first, then view its provenance here."}</div></div>`;
+  }
+  return `
+  <div class="topbar"><div><div class="page-title">Provenance — ${esc(p.query_id)}</div><div class="page-sub">Full audit trail of how this result was produced</div></div></div>
+
+  <div class="card">
+    <div class="card-title">Execution flow</div>
+    <div class="prov-flow">
+      <div class="prov-step">Canonical Query</div><div class="prov-arrow">↓</div>
+      <div class="prov-step">Authorization (${esc(p.researcher_id)})</div><div class="prov-arrow">↓</div>
+      <div class="prov-step">Query Planner</div><div class="prov-arrow">↓</div>
+      <div class="prov-branch">${p.participating_institutions.map(id => `<div class="prov-step" style="min-width:140px">${esc(instName(id))}</div>`).join("")}</div>
+      <div class="prov-arrow">↓</div>
+      <div class="prov-step">Aggregation (${esc(p.aggregation_method)})</div><div class="prov-arrow">↓</div>
+      <div class="prov-step" style="border-color:var(--teal);color:var(--teal)">Final Result — ${p.final_result}</div>
+    </div>
+  </div>
+
+  <div class="grid grid-2 section-gap">
+    <div class="card">
+      <div class="card-title">Metadata</div>
+      <dl class="kv-grid">
+        <dt>Query ID</dt><dd>${esc(p.query_id)}</dd>
+        <dt>Query hash (SHA-256)</dt><dd style="font-size:11px">${esc(p.query_hash)}</dd>
+        <dt>Timestamp</dt><dd>${esc(p.timestamp)}</dd>
+        <dt>Completeness</dt><dd>${statusBadge(p.completeness)}</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <div class="card-title">Institution statuses</div>
+      ${Object.entries(p.institution_statuses).map(([id, st]) => `
+        <div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12.5px">
+          <span>${esc(instName(id))}</span>${statusBadge(st)}
+        </div>`).join("")}
+    </div>
+  </div>
+
+  <div class="card section-gap">
+    <div class="card-title">Canonical query</div>
+    <div class="query-json-preview">${esc(JSON.stringify(p.canonical_query, null, 2))}</div>
+  </div>`;
+}
+
+// ============================================================================
+// Audit
+// ============================================================================
+function renderAudit() {
+  const rows = state.auditEntries.map(e => `
+    <tr class="row-hover">
+      <td class="mono" style="font-size:11px">${esc((e.timestamp||"").replace("T"," ").replace("Z",""))}</td>
+      <td>${esc(e.user_name || e.user || "—")}</td>
+      <td>${statusBadge(e.event_type)}</td>
+      <td class="mono" style="font-size:11px">${esc((e.details && e.details.query_id) || "")}</td>
+      <td class="mono" style="font-size:11px">${esc((e.details && e.details.institution) || "")}</td>
+      <td>${e.details && e.details.status ? statusBadge(e.details.status) : ""}</td>
+    </tr>`).join("");
+
+  return `
+  <div class="topbar"><div><div class="page-title">Audit Log</div><div class="page-sub">Every sensitive operation generates an audit event — no patient data recorded</div></div>
+    <button class="btn btn-sm" id="refresh-audit">${state.loading.audit ? "Refreshing…" : "Refresh"}</button>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr><th>Timestamp</th><th>User</th><th>Event</th><th class="mono">Query</th><th>Institution</th><th>Status</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="6"><div class="empty-state">No audit events yet.</div></td></tr>`}</tbody>
+    </table>
+  </div>`;
+}
+
+// ============================================================================
+// Benchmark
+// ============================================================================
+function renderBenchmark() {
+  const b = state.benchmarkResult;
+  return `
+  <div class="topbar"><div><div class="page-title">Performance Benchmark</div><div class="page-sub">Federated execution vs. a centralized baseline — measured, not hard-coded</div></div>
+    <button class="btn btn-primary btn-sm" id="run-benchmark-btn" ${state.loading.benchmark ? "disabled" : ""}>${state.loading.benchmark ? `<span class="spinner"></span> Running…` : "Run benchmark"}</button>
+  </div>
+  ${b ? `
+  <div class="grid grid-2">
+    <div class="card">
+      <div class="card-title">Federated <span class="hint">production architecture</span></div>
+      <dl class="kv-grid">
+        <dt>Latency</dt><dd>${b.federated.latency_ms} ms</dd>
+        <dt>Institutions</dt><dd>${b.federated.institutions}</dd>
+        <dt>Successful nodes</dt><dd>${b.federated.successful_institutions}</dd>
+        <dt>Failed nodes</dt><dd>${b.federated.failed_institutions}</dd>
+        <dt>Data transferred</dt><dd>${b.federated.data_transferred_bytes} bytes</dd>
+        <dt>Central patient DB</dt><dd>${b.federated.central_patient_database}</dd>
+        <dt>Result</dt><dd>${b.federated.final_result}</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <div class="card-title">Centralized baseline <span class="hint">benchmark-only, never used to answer real queries</span></div>
+      <dl class="kv-grid">
+        <dt>Latency</dt><dd>${b.centralized_baseline.latency_ms} ms</dd>
+        <dt>Institutions</dt><dd>${b.centralized_baseline.institutions}</dd>
+        <dt>Records scanned</dt><dd>${b.centralized_baseline.records_scanned.toLocaleString()}</dd>
+        <dt>Data transferred</dt><dd>${b.centralized_baseline.data_transferred_bytes.toLocaleString()} bytes</dd>
+        <dt>Central patient DB</dt><dd>${b.centralized_baseline.central_patient_database}</dd>
+        <dt>Result</dt><dd>${b.centralized_baseline.final_result}</dd>
+      </dl>
+    </div>
+  </div>
+  <div class="card section-gap">
+    <div class="card-title">Demo query used</div>
+    <div class="query-json-preview">${esc(JSON.stringify(b.query_used, null, 2))}</div>
+  </div>
+  ` : `<div class="card"><div class="empty-state">Run the benchmark to measure real federated vs. centralized latency and data-transfer figures against live synthetic data.</div></div>`}
+  `;
+}
+
+// ============================================================================
+// Event wiring
+// ============================================================================
+function attachHandlers() {
+  const app = document.getElementById("app");
+
+  const loginForm = document.getElementById("login-form");
+  if (loginForm) loginForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const fd = new FormData(loginForm);
+    login(fd.get("username"), fd.get("password"));
+  });
+
+  app.querySelectorAll("[data-nav]").forEach(el => el.addEventListener("click", () => setView(el.dataset.nav)));
+  const logoutBtn = document.getElementById("logout-btn");
+  if (logoutBtn) logoutBtn.addEventListener("click", logout);
+
+  // Query builder
+  const addDiag = document.getElementById("add-diagnosis");
+  if (addDiag) addDiag.addEventListener("click", () => { state.qb.diagnosis.push({ code: "" }); render(); });
+  const addMed = document.getElementById("add-medication");
+  if (addMed) addMed.addEventListener("click", () => { state.qb.medication.push({ code: "" }); render(); });
+  const addLab = document.getElementById("add-lab");
+  if (addLab) addLab.addEventListener("click", () => { state.qb.lab.push({ code: "", operator: ">", value: "7" }); render(); });
+
+  app.querySelectorAll("[data-remove]").forEach(el => el.addEventListener("click", () => {
+    const kind = el.dataset.remove, idx = parseInt(el.dataset.idx, 10);
+    state.qb[kind].splice(idx, 1);
+    render();
+  }));
+
+  app.querySelectorAll("[data-qb]").forEach(el => el.addEventListener("change", () => {
+    const kind = el.dataset.qb, idx = parseInt(el.dataset.idx, 10), field = el.dataset.field;
+    state.qb[kind][idx][field] = el.value;
+    render();
+  }));
+
+  const dateStart = document.getElementById("date-start");
+  if (dateStart) dateStart.addEventListener("change", () => { state.qb.dateStart = dateStart.value; render(); });
+  const dateEnd = document.getElementById("date-end");
+  if (dateEnd) dateEnd.addEventListener("change", () => { state.qb.dateEnd = dateEnd.value; render(); });
+
+  app.querySelectorAll("[data-logic]").forEach(el => el.addEventListener("click", () => { state.qb.logic = el.dataset.logic; render(); }));
+
+  const execBtn = document.getElementById("execute-query-btn");
+  if (execBtn) execBtn.addEventListener("click", executeQuery);
+
+  const validateBtn = document.getElementById("validate-btn");
+  if (validateBtn) validateBtn.addEventListener("click", validateCurrentQuery);
+
+  app.querySelectorAll("[data-nav-load-prov]").forEach(el => el.addEventListener("click", () => loadProvenance(el.dataset.navLoadProv)));
+
+  app.querySelectorAll("[data-sim-failure]").forEach(el => el.addEventListener("click", () => simulateFailure(el.dataset.simFailure)));
+  app.querySelectorAll("[data-restore]").forEach(el => el.addEventListener("click", () => restoreInstitution(el.dataset.restore)));
+
+  const refreshAudit = document.getElementById("refresh-audit");
+  if (refreshAudit) refreshAudit.addEventListener("click", loadAudit);
+
+  const runBench = document.getElementById("run-benchmark-btn");
+  if (runBench) runBench.addEventListener("click", runBenchmark);
+}
+
+render();
+</script>
+</body>
+</html>
